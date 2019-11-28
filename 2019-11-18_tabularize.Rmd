@@ -1,0 +1,195 @@
+---
+title: "Visualize progress"
+output: html_document
+---
+
+## Preprocess
+Setup:
+```{r}
+library(tidyverse)
+library(lubridate)
+library(gganimate)
+library(stringi)
+library(superheat)
+library(googlesheets4)
+```
+
+
+Load in the data and tidy things up:
+```{r}
+set.seed(1618)
+log_range <- 'A3:N24'
+start_date <- as.Date('2019-11-04')
+end_date <- as.Date('2019-11-24')
+min_req <- c(300, 100, 300, 300, 30, 3, 100, 30, 30, 300, 10, 15, 30)
+quaker_url <- read_lines('log-url.txt')
+n_acts <- length(min_req)
+weeks <- rep(paste('Week', 1:3), each = 7)
+
+direct_read <- sheets_get(quaker_url)
+sheets <- direct_read$sheets$name
+n_sheets <- length(sheets)
+dat <- list()
+
+s_monsters <- read_csv('steem-monsters.txt') %>% 
+  mutate(Name = gsub("'", '', Name)) %>%
+  sample_n(n_sheets) %>% 
+  pull(Name) %>% 
+  tibble(s_monster = ., person = sheets)
+
+for (id in sheets) {
+  if (id != 'Master Sheet') {
+    id_regular <- s_monsters %>% 
+      filter(person == id) %>% 
+      pull(s_monster)
+      
+    dat[[id_regular]] <-
+      read_sheet(quaker_url, sheet = id, range = log_range) %>% 
+      mutate_at(-1, ~ replace(., is.na(.), 0)) %>%
+      mutate(id = id_regular) %>%
+      select(id, everything())
+  }
+}
+
+tidy_dat <- do.call(rbind.data.frame, c(dat, make.row.names = F))
+```
+
+Build data frames:
+```{r}
+cum_dat <- tidy_dat %>%
+  group_by(id) %>%
+  arrange(Date) %>%
+  mutate_at(vars(-id,-Date), cumsum) %>%
+  ungroup()
+
+final_cum <- cum_dat %>% 
+  filter(Date == end_date)
+
+no_log <- final_cum$id[rowSums(final_cum[, -(1:2)]) == 0]
+
+requirements <- tibble(
+  category = colnames(cum_dat)[-(1:2)],
+  min = min_req)
+
+proportion_dat <- t(t(cum_dat[, -(1:2)])/requirements$min) %>% 
+  as_tibble() %>% 
+  mutate_all(~ (ifelse(. > 1, 1, .))) %>% 
+  bind_cols(cum_dat[, 1:2], .) %>% 
+  filter(!(id %in% no_log)) %>% 
+  ungroup()
+
+proportion_sum <- proportion_dat %>% 
+  mutate(`Completed proportion` = rowSums(.[, 3:(n_acts+2)])) %>% 
+  select(id, Date, `Completed proportion`)
+
+sorted_ids <- proportion_sum %>%
+  filter(Date == end_date) %>% 
+  arrange(`Completed proportion`) %>% 
+  pull(id)
+```
+
+
+## Still figures
+
+Combined effort:
+
+```{r}
+combined_dat <- tidy_dat %>% 
+  select(-id) %>% 
+  group_by(Date) %>% 
+  summarise_all(sum) %>% 
+  column_to_rownames('Date')
+
+colnames(combined_dat) <- gsub(' \\(.+\\)', '', colnames(combined_dat))
+
+png("superheat.png", height = 400, width = 700)
+superheat(
+  t(combined_dat) / requirements$min,
+  title = 'Quaker Strong conjoined effort, Nov 2019',
+  row.dendrogram = T,
+  grid.hline.col = "white",
+  grid.vline.col = "white",
+  left.label.text.alignment = 'right',
+  left.label.col = 'white',
+  membership.cols = weeks,
+  bottom.label.text.angle = 0,
+  bottom.label.col = 'white'
+)
+dev.off()
+# Why can't I use ggsave here?!
+```
+
+
+Leading participants per activity:
+```{r}
+top_plot <- list()
+for (cat in requirements$category){
+  top_performers <- final_cum %>% 
+    mutate(rank = rank(desc(!!sym(cat)))) %>% 
+    filter(rank < 6)
+  
+  if (nrow(top_performers) < 6){ # ignore ties
+    top_plot[[cat]] <- cum_dat %>% 
+      filter(id %in% top_performers$id) %>%
+      ggplot(aes(as_date(Date), !!sym(cat), color = id)) +
+      scale_x_date(limits = as_date(c(min(cum_dat$Date), max(cum_dat$Date) + 4*10^5))) +
+      geom_step() +
+      geom_hline(yintercept = requirements %>% filter(category == cat) %>% pull(min),
+                 linetype = 2) +
+      paletteer::scale_colour_paletteer_d(wesanderson, Cavalcanti1)+
+      guides(color = F) +
+      labs(x = NULL) +
+      theme_bw() +
+      ggrepel::geom_text_repel(
+        data = top_performers,
+        size = 3,
+        direction = 'y',
+        nudge_x = 45,
+        segment.alpha = 0,
+        aes(label = id)
+      ) 
+  }
+}
+do.call(cowplot::plot_grid, c(top_plot, ncol = 3))
+```
+
+
+
+
+
+## Giffy gif gifs
+
+First, let's try with `gganimate`:
+
+```{r}
+try1 <- proportion_dat %>%
+  mutate(Date = as.character(Date)) %>%
+  # filter(Date == end_date) %>%
+  mutate(id = factor(id, levels = sorted_ids)) %>%
+  pivot_longer(-c(id, Date), names_to = 'Activity', values_to = 'Completed proportion') %>%
+  ggplot(aes(id, `Completed proportion`)) +
+  geom_col(position = 'stack', aes(fill = Activity)) +
+  paletteer::scale_fill_paletteer_d(palettetown, marowak) +
+  labs(x = NULL) +
+  coord_flip() +
+  theme_bw() +
+  geom_text(
+    aes(label = id),
+    data = proportion_sum %>% filter(Date == as.Date(Date)),
+    size = 4,
+    hjust = 'left',
+    nudge_y = 0.2,
+    color = 'grey40'
+  ) +
+  geom_hline(yintercept = 13, color = 'grey20', linetype = 'dashed') +
+  scale_x_discrete(labels = NULL, breaks = NULL) +
+  scale_y_continuous(limits = c(NA, 18), breaks = seq(0, 12, 2), expand = c(0, 0)) +
+  transition_states(Date, wrap = F, transition_length = 3, state_length = 0) +
+  labs(title = "Date: {closest_state}") +
+  ease_aes('linear')
+
+animate(try1, renderer = gifski_renderer('leaderboard-smooth.gif', loop = F))
+
+```
+
+
